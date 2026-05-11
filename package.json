@@ -1,0 +1,14 @@
+{
+  "name": "quazr-image-worker",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.500.0",
+    "@aws-sdk/lib-storage": "^3.500.0",
+    "amqplib": "^0.10.3",
+    "sharp": "^0.33.3"
+  }
+}
