@@ -28,7 +28,7 @@
 
 		// Advanced Type Safety
 		"noUncheckedIndexedAccess": true,
-		"exactOptionalPropertyTypes": true,
+		"exactOptionalPropertyTypes": false,
 		"noPropertyAccessFromIndexSignature": true,
 
 		// Module & Resolution
