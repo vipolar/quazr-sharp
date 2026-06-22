@@ -137,9 +137,9 @@ class ImageProcessingWorker {
             });
 
             await this.channel.prefetch(5);
-            this.channel.consume(this.imagesTasksQueue, (msg) => {
-                if (msg) {
-                    this.processMessage(msg);
+            this.channel.consume(this.imagesTasksQueue, (message) => {
+                if (message) {
+                    this.processMessage(message);
                 }
             });
         } catch (error) {

@@ -1,8 +1,8 @@
-import { S3ServiceException, InvalidObjectState, AccessDenied, NoSuchKey } from '@aws-sdk/client-s3';
-import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, GetObjectCommand, ChecksumAlgorithm } from '@aws-sdk/client-s3';
+import { NodeHttpHandler } from "@smithy/node-http-handler";
 import { Upload } from '@aws-sdk/lib-storage';
-import type { Readable } from 'stream';
 import { TaskError } from './errors.js';
+import { Readable } from 'stream';
 import pQueue from 'p-queue';
 
 export class ImageBucket {
@@ -28,14 +28,14 @@ export class ImageBucket {
         const SHARP_CACHE_SIZE = maxCacheSize || parseInt(process.env['SHARP_CACHE_SIZE'] || '500000000', 10);
 
         if (QUEUE_TIMEOUT_MS <= 0) {
-            throw new Error("QUEUE_TIMEOUT_MS must be a positive integer");
+            throw new Error("Optional env variable QUEUE_TIMEOUT_MS must be a positive integer if set");
         }
 
         if (SHARP_CACHE_SIZE <= 0) {
-            throw new Error("SHARP_CACHE_SIZE must be a positive integer");
+            throw new Error("Optional env variable SHARP_CACHE_SIZE must be a positive integer if set");
         }
 
-        this.s3Bucket = s3?.s3Bucket || process.env['BE_BUCKET_NAME'] || 'test';
+        this.s3Bucket = s3?.s3Bucket || process.env['BE_IMAGES_BUCKET'] || 'quazr-images';
         this.queue = new pQueue({ concurrency: 1 });
         this.queueTimeoutMs = QUEUE_TIMEOUT_MS;
         this.maxCacheSize = SHARP_CACHE_SIZE;
@@ -49,23 +49,53 @@ export class ImageBucket {
                 secretAccessKey: S3_PASSWORD,
                 accessKeyId: S3_USER,
             },
-            forcePathStyle: true
+            requestHandler: new NodeHttpHandler({
+                connectionTimeout: 15000,
+                requestTimeout: 90000,
+            }),
+            forcePathStyle: true,
+            maxAttempts: 3
         });
     };
 
     async uploadImageToBucket(outputKey: string, processedImage: Buffer<ArrayBufferLike>, format: string) {
-        //TODO: check if upload was actually successful
-        const upload = new Upload({
-            client: this.s3,
-            params: {
-                Key: outputKey,
-                Body: processedImage,
-                Bucket: this.s3Bucket,
-                ContentType: `image/${format}`
-            }
-        });
+        try {
+            const upload = new Upload({
+                client: this.s3,
+                params: {
+                    Key: outputKey,
+                    Body: processedImage,
+                    Bucket: this.s3Bucket,
+                    ContentType: `image/${format}`,
+                    ChecksumAlgorithm: ChecksumAlgorithm.CRC32,
+                }
+            });
 
-        await upload.done();
+            await upload.done();
+        } catch (error: unknown) {
+            if (error instanceof Error && error.name) {
+                switch (error.name) {
+                    case "NoSuchBucket":
+                        throw new TaskError("No such bucket is present in the S3 instance", error, 40501);
+                    case "TimeoutError":
+                        throw new TaskError("Operation failed due to a network timeout error", error, 40408);
+                    case "AccessDenied":
+                        throw new TaskError("Permission denied while uploading the image to S3", error, 40403);
+                    case "EntityTooLarge":
+                        throw new TaskError("Operation failed due to image file being too large", error, 40413);
+                    case "InvalidObjectState":
+                        throw new TaskError("S3 client rejected due to being in an invalid state", error, 40409);
+                    case "CredentialsProviderError":
+                        throw new TaskError("Operation failed due to storage authentication error", error, 40423);
+                    case "S3ServiceException":
+                        throw new TaskError("Unexpected error while transmitting image to S3", error, 40500);
+                    default:
+                        throw new TaskError("Unknown error while transmitting image to S3", error, 40000);
+                }
+            }
+
+            throw new TaskError("Unknown error while transmitting image to S3", error, 40000);
+        }
     };
 
     async cacheImageBuffer(imageKey: string, imageBuffer: Buffer<ArrayBufferLike>): Promise<void> {
@@ -96,46 +126,54 @@ export class ImageBucket {
                         }
                     }
                 } catch (error: unknown) {
-                    console.error("Unexpected error during cache operation:", error);
-                    //throw error;
+                    throw new TaskError("Unexpected error while caching image buffer", error, 31001);
                 }
-            },
-            { timeout: this.queueTimeoutMs }
+            }, { timeout: this.queueTimeoutMs }
         );
     };
 
-    async downloadImageFromBucket(imageKey: string, ignoreCached: boolean = false): Promise<Readable | Buffer<ArrayBufferLike>> {
-        let cachedImageBuffer: Buffer<ArrayBufferLike> | undefined = this.cache.get(imageKey);
+    async downloadImageFromBucket(imageKey: string): Promise<Readable> {
         let readStream: Readable | undefined;
 
-        if (!cachedImageBuffer || ignoreCached) {
-            const getCommand = new GetObjectCommand({ Bucket: this.s3Bucket, Key: imageKey });
+        try {
+            const getCommand = new GetObjectCommand({
+                ChecksumMode: "ENABLED",
+                Bucket: this.s3Bucket,
+                Key: imageKey
+            });
 
-            try {
-                const { Body } = await this.s3.send(getCommand);
-                readStream = Body as Readable | undefined;
-            } catch (error: unknown) {
-                if (error instanceof NoSuchKey) {
-                    throw new TaskError('No such image is present in the S3 bucket', error, 404);
-                } else if (error instanceof AccessDenied) {
-                    throw new TaskError('Permission denied while trying to access S3 object', error, 403);
-                } else if (error instanceof InvalidObjectState) {
-                    throw new TaskError('S3 object is in an invalid state and cannot be retrieved', error, 409);
-                } else if (error instanceof S3ServiceException) {
-                    throw new TaskError('Unexpected error while retrieving image from S3', error, 500);
-                } else {
-                    throw new TaskError('Unknown error while retrieving image from S3', error, 500);
+            const { Body } = await this.s3.send(getCommand);
+            readStream = Body as Readable | undefined;
+        } catch (error: unknown) {
+            if (error instanceof Error && error.name) {
+                switch (error.name) {
+                    case "NoSuchKey":
+                        throw new TaskError("No such image is present in the S3 bucket", error, 10404);
+                    case "NoSuchBucket":
+                        throw new TaskError("No such bucket is present in the S3 instance", error, 10501);
+                    case "TimeoutError":
+                        throw new TaskError("Operation failed due to a network timeout error", error, 10408);
+                    case "AccessDenied":
+                        throw new TaskError("Permission denied while trying to access S3 image", error, 10403);
+                    case "InvalidObjectState":
+                        throw new TaskError("S3 client rejected due to being in an invalid state", error, 10409);
+                    case "CredentialsProviderError":
+                        throw new TaskError("Operation failed due to storage authentication error", error, 10423);
+                    case "S3ServiceException":
+                        throw new TaskError("Unexpected error while retrieving image from S3", error, 10500);
+                    default:
+                        throw new TaskError("Unknown error while retrieving image from S3", error, 10000);
                 }
             }
 
-            if (!readStream) {
-                throw new TaskError('Failed to retrieve image stream from S3 bucket', 500);
-            }
-
-            return readStream as Readable;
+            throw new TaskError('Unknown error while retrieving image from S3', error, 10000);
         }
 
-        return cachedImageBuffer;
+        if (!readStream || !(readStream instanceof Readable)) {
+            throw new TaskError('Failed to retrieve image stream from S3 bucket', 10500);
+        }
+
+        return readStream;
     };
 
     getImageBuffer(imageKey: string): Buffer<ArrayBufferLike> | undefined {
